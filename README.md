@@ -61,6 +61,5 @@ geode build
 
 ## Credits
 
-Made with ❤️ by **jodiexpress**
 
 Made with ❤️ by **jodiexpress**
