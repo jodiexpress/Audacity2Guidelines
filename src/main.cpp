@@ -5,14 +5,17 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <thread>
 #include <atomic>
 #include <cmath>
 #include <iomanip>
 
+#ifdef GEODE_IS_WINDOWS
+#include <windows.h>
+#include <commdlg.h>
+#endif
+
 using namespace geode::prelude;
 
-// Safe string-to-double без try/catch и std::stod
 static bool safeToDouble(const std::string& s, double& out) {
     if (s.empty()) return false;
     char* end = nullptr;
@@ -61,6 +64,23 @@ static std::string parseAudacityFile(const std::string& path) {
     return result;
 }
 
+static std::string openFileDialog() {
+#ifdef GEODE_IS_WINDOWS
+    OPENFILENAMEA ofn;
+    CHAR szFile[MAX_PATH] = {0};
+    ZeroMemory(&ofn, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = nullptr;
+    ofn.lpstrFile = szFile;
+    ofn.nMaxFile = sizeof(szFile);
+    ofn.lpstrFilter = "Audacity Labels\0*.txt\0All Files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
+    if (GetOpenFileNameA(&ofn)) return std::string(szFile);
+#endif
+    return "";
+}
+
 struct BPMResult {
     std::string guidelines;
     std::string audacityTxt;
@@ -106,20 +126,7 @@ static BPMResult generateBPMGuidelines(double bpm, double start, double end, std
     return result;
 }
 
-// Кросс-платформенный диалог сохранения через Geode
-static std::string saveFileDialog() {
-#ifdef GEODE_IS_WINDOWS
-    // На Windows используем Geode file picker если доступен,
-    // иначе fallback на стандартный путь в папку с уровнями
-    auto path = dirs::getLevelsSaveDir() / "audacity_labels.txt";
-    return path.string();
-#else
-    auto path = dirs::getLevelsSaveDir() / "audacity_labels.txt";
-    return path.string();
-#endif
-}
-
-class BPMPopup : public geode::Popup<LevelSettingsObject*> {
+class BPMPopup : public FLAlertLayer {
 public:
     LevelSettingsObject* m_settings;
     TextInput* m_bpmInput;
@@ -130,7 +137,7 @@ public:
 
     static BPMPopup* create(LevelSettingsObject* settings) {
         auto ret = new BPMPopup();
-        if (ret && ret->initAnchored(280.f, 300.f, settings)) {
+        if (ret && ret->initPopup(settings)) {
             ret->autorelease();
             return ret;
         }
@@ -138,24 +145,25 @@ public:
         return nullptr;
     }
 
-    bool setup(LevelSettingsObject* settings) override {
+    bool initPopup(LevelSettingsObject* settings) {
+        // delegate, title, desc, btn1, btn2, width, scroll, height, textScale
+        if (!FLAlertLayer::init(nullptr, "Generate BPM Guidelines", "", "OK", nullptr, 280.f, false, 300.f, 1.f)) return false;
         m_settings = settings;
-        this->setTitle("Generate BPM Guidelines");
 
         auto menu = CCMenu::create();
-        menu->setPosition(this->m_mainLayer->getContentSize() / 2);
-        this->m_mainLayer->addChild(menu);
+        menu->setPosition(m_mainLayer->getContentSize() / 2);
+        m_mainLayer->addChild(menu);
 
         float y = 80;
         float gap = 35;
 
         auto addRow = [&](const char* labelStr, TextInput*& input, const char* savedKey, const char* placeholder, const char* filter) {
-            auto contentSize = this->m_mainLayer->getContentSize();
+            auto contentSize = m_mainLayer->getContentSize();
             auto lbl = CCLabelBMFont::create(labelStr, "bigFont.fnt");
             lbl->setScale(0.4f);
             lbl->setAnchorPoint({1, 0.5f});
             lbl->setPosition(contentSize.width / 2 - 10, contentSize.height / 2 + y);
-            this->m_mainLayer->addChild(lbl);
+            m_mainLayer->addChild(lbl);
             input = TextInput::create(110.f, placeholder, "chatFont.fnt");
             input->setFilter(filter);
             auto saved = Mod::get()->getSavedValue<std::string>(savedKey, "");
@@ -224,7 +232,6 @@ public:
             Notification::create("Invalid input!", NotificationIcon::Error)->show();
             return;
         }
-        // offset необязателен — ошибку игнорируем
         safeToDouble(m_offsetInput->getString(), offset);
 
         Mod::get()->setSavedValue("bpm_val",      std::string(m_bpmInput->getString()));
@@ -253,21 +260,17 @@ public:
         m_settings->m_guidelinesUpdated = true;
         if (auto* editor = LevelEditorLayer::get()) editor->levelSettingsUpdated();
 
-        auto savePath = saveFileDialog();
-        if (!savePath.empty()) {
-            std::ofstream outFile(savePath);
-            if (outFile.is_open()) {
-                outFile << result.audacityTxt;
-                outFile.close();
-                Notification::create("Saved & imported!", NotificationIcon::Success)->show();
-            } else {
-                Notification::create("Could not save file!", NotificationIcon::Error)->show();
-            }
+        auto savePath = Mod::get()->getSaveDir() / "audacity_labels.txt";
+        std::ofstream outFile(savePath);
+        if (outFile.is_open()) {
+            outFile << result.audacityTxt;
+            outFile.close();
+            Notification::create("Saved & imported!", NotificationIcon::Success)->show();
         } else {
             Notification::create("BPM guidelines generated!", NotificationIcon::Success)->show();
         }
 
-        this->onClose(nullptr);
+        this->keyBackClicked();
     }
 };
 
@@ -307,37 +310,33 @@ class $modify(MyCreateGuidelinesLayer, CreateGuidelinesLayer) {
         bool expected = false;
         if (!s_picking.compare_exchange_strong(expected, true)) return;
 
+#ifdef GEODE_IS_WINDOWS
         auto* delegate = m_delegate;
-
-        // Используем file::pickFile из Geode — кросс-платформенный пикер
-        file::FilePickOptions options{
-            std::nullopt,
-            {{ "Audacity Labels", { "*.txt" } }}
-        };
-
-        file::pickFile(file::PickMode::OpenFile, options, [delegate](ghc::filesystem::path path) {
+        Loader::get()->queueInMainThread([delegate]() {
+            auto path = openFileDialog();
             s_picking = false;
-            auto guidelines = parseAudacityFile(path.string());
+            if (path.empty()) return;
+
+            auto guidelines = parseAudacityFile(path);
             if (guidelines.empty()) {
-                Loader::get()->queueInMainThread([]() {
-                    Notification::create("Failed to parse file!", NotificationIcon::Error)->show();
-                });
+                Notification::create("Failed to parse file!", NotificationIcon::Error)->show();
                 return;
             }
-            Loader::get()->queueInMainThread([delegate, guidelines]() {
-                auto* settings = delegate->getLevelSettings();
-                if (!settings) {
-                    Notification::create("Could not find level settings!", NotificationIcon::Error)->show();
-                    return;
-                }
-                auto existing = std::string(settings->m_guidelineString);
-                settings->m_guidelineString = existing + guidelines;
-                settings->m_guidelinesUpdated = true;
-                if (auto* editor = LevelEditorLayer::get()) editor->levelSettingsUpdated();
-                Notification::create("Guidelines imported!", NotificationIcon::Success)->show();
-            });
-        }, [](auto) {
-            s_picking = false;
+
+            auto* settings = delegate->getLevelSettings();
+            if (!settings) {
+                Notification::create("Could not find level settings!", NotificationIcon::Error)->show();
+                return;
+            }
+            auto existing = std::string(settings->m_guidelineString);
+            settings->m_guidelineString = existing + guidelines;
+            settings->m_guidelinesUpdated = true;
+            if (auto* editor = LevelEditorLayer::get()) editor->levelSettingsUpdated();
+            Notification::create("Guidelines imported!", NotificationIcon::Success)->show();
         });
+#else
+        s_picking = false;
+        Notification::create("Import not supported on this platform", NotificationIcon::Warning)->show();
+#endif
     }
 };
