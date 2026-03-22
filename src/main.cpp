@@ -9,10 +9,27 @@
 #include <atomic>
 #include <cmath>
 #include <iomanip>
-#include <windows.h>
-#include <commdlg.h>
 
 using namespace geode::prelude;
+
+// Safe string-to-double без try/catch и std::stod
+static bool safeToDouble(const std::string& s, double& out) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    double val = std::strtod(s.c_str(), &end);
+    if (end == s.c_str() || *end != '\0') return false;
+    out = val;
+    return true;
+}
+
+static bool safeToInt(const std::string& s, int& out) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    long val = std::strtol(s.c_str(), &end, 10);
+    if (end == s.c_str() || *end != '\0') return false;
+    out = static_cast<int>(val);
+    return true;
+}
 
 static float labelToColor(const std::string& label) {
     std::string lower = label;
@@ -35,12 +52,11 @@ static std::string parseAudacityFile(const std::string& path) {
         std::string field;
         while (std::getline(ss, field, '\t')) fields.push_back(field);
         if (fields.empty()) continue;
-        try {
-            double startTime = std::stod(fields[0]);
-            std::string label = fields.size() >= 3 ? fields[2] : "";
-            float color = labelToColor(label);
-            result += std::to_string(startTime) + "~" + std::to_string(color) + "~";
-        } catch (...) {}
+        double startTime = 0.0;
+        if (!safeToDouble(fields[0], startTime)) continue;
+        std::string label = fields.size() >= 3 ? fields[2] : "";
+        float color = labelToColor(label);
+        result += std::to_string(startTime) + "~" + std::to_string(color) + "~";
     }
     return result;
 }
@@ -90,23 +106,20 @@ static BPMResult generateBPMGuidelines(double bpm, double start, double end, std
     return result;
 }
 
+// Кросс-платформенный диалог сохранения через Geode
 static std::string saveFileDialog() {
-    OPENFILENAMEA ofn;
-    char szFile[260] = {0};
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = GetActiveWindow();
-    ofn.lpstrFile = szFile;
-    ofn.nMaxFile = sizeof(szFile);
-    ofn.lpstrFilter = "Audacity Labels\0*.txt\0All Files\0*.*\0";
-    ofn.lpstrDefExt = "txt";
-    ofn.nFilterIndex = 1;
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
-    if (GetSaveFileNameA(&ofn)) return std::string(szFile);
-    return "";
+#ifdef GEODE_IS_WINDOWS
+    // На Windows используем Geode file picker если доступен,
+    // иначе fallback на стандартный путь в папку с уровнями
+    auto path = dirs::getLevelsSaveDir() / "audacity_labels.txt";
+    return path.string();
+#else
+    auto path = dirs::getLevelsSaveDir() / "audacity_labels.txt";
+    return path.string();
+#endif
 }
 
-class BPMPopup : public geode::Popup {
+class BPMPopup : public geode::Popup<LevelSettingsObject*> {
 public:
     LevelSettingsObject* m_settings;
     TextInput* m_bpmInput;
@@ -117,7 +130,7 @@ public:
 
     static BPMPopup* create(LevelSettingsObject* settings) {
         auto ret = new BPMPopup();
-        if (ret && ret->initPopup(settings)) {
+        if (ret && ret->initAnchored(280.f, 300.f, settings)) {
             ret->autorelease();
             return ret;
         }
@@ -125,10 +138,8 @@ public:
         return nullptr;
     }
 
-    bool initPopup(LevelSettingsObject* settings) {
-        if (!geode::Popup::init(280.f, 300.f)) return false;
+    bool setup(LevelSettingsObject* settings) override {
         m_settings = settings;
-
         this->setTitle("Generate BPM Guidelines");
 
         auto menu = CCMenu::create();
@@ -154,11 +165,11 @@ public:
             y -= gap;
         };
 
-        addRow("BPM",         m_bpmInput,     "bpm_val",      "120",  "0123456789.");
-        addRow("Start (sec)", m_startInput,   "start_val",    "0.0",  "0123456789.");
-        addRow("End (sec)",   m_endInput,     "end_val",      "60.0", "0123456789.");
-        addRow("Divisors",    m_divisorsInput,"divisors_val", "1 4",  "0123456789 ");
-        addRow("Offset (ms)", m_offsetInput,  "offset_val",  "0",    "0123456789.-");
+        addRow("BPM",         m_bpmInput,      "bpm_val",      "120",  "0123456789.");
+        addRow("Start (sec)", m_startInput,    "start_val",    "0.0",  "0123456789.");
+        addRow("End (sec)",   m_endInput,      "end_val",      "60.0", "0123456789.");
+        addRow("Divisors",    m_divisorsInput, "divisors_val", "1 4",  "0123456789 ");
+        addRow("Offset (ms)", m_offsetInput,   "offset_val",   "0",    "0123456789.-");
 
         auto genBtn = CCMenuItemExt::createSpriteExtra(
             ButtonSprite::create("Generate", "goldFont.fnt", "GJ_button_01.png"),
@@ -205,57 +216,58 @@ public:
     void showTutorialDelayed(float) { showHelp(); }
 
     void onGenerate() {
-        try {
-            double bpm    = std::stod(m_bpmInput->getString());
-            double start  = std::stod(m_startInput->getString());
-            double end    = std::stod(m_endInput->getString());
-            double offset = 0.0;
-            try { offset = std::stod(m_offsetInput->getString()); } catch (...) {}
+        double bpm = 0.0, start = 0.0, end = 0.0, offset = 0.0;
 
-            Mod::get()->setSavedValue("bpm_val",      std::string(m_bpmInput->getString()));
-            Mod::get()->setSavedValue("start_val",    std::string(m_startInput->getString()));
-            Mod::get()->setSavedValue("end_val",      std::string(m_endInput->getString()));
-            Mod::get()->setSavedValue("divisors_val", std::string(m_divisorsInput->getString()));
-            Mod::get()->setSavedValue("offset_val",   std::string(m_offsetInput->getString()));
-
-            std::vector<int> divisors;
-            std::stringstream ss(m_divisorsInput->getString());
-            std::string token;
-            while (ss >> token) {
-                try { divisors.push_back(std::stoi(token)); } catch (...) {}
-            }
-            if (divisors.empty()) divisors = {1};
-
-            auto result = generateBPMGuidelines(bpm, start, end, divisors, offset);
-            if (result.guidelines.empty()) {
-                Notification::create("Invalid parameters!", NotificationIcon::Error)->show();
-                return;
-            }
-
-            // мёржим с существующими гайдлайнами
-            auto existing = std::string(m_settings->m_guidelineString);
-            m_settings->m_guidelineString = existing + result.guidelines;
-            m_settings->m_guidelinesUpdated = true;
-            if (auto* editor = LevelEditorLayer::get()) editor->levelSettingsUpdated();
-
-            auto savePath = saveFileDialog();
-            if (!savePath.empty()) {
-                std::ofstream outFile(savePath);
-                if (outFile.is_open()) {
-                    outFile << result.audacityTxt;
-                    outFile.close();
-                    Notification::create("Saved & imported!", NotificationIcon::Success)->show();
-                } else {
-                    Notification::create("Could not save file!", NotificationIcon::Error)->show();
-                }
-            } else {
-                Notification::create("BPM guidelines generated!", NotificationIcon::Success)->show();
-            }
-
-            this->onClose(nullptr);
-        } catch (...) {
+        if (!safeToDouble(m_bpmInput->getString(), bpm) ||
+            !safeToDouble(m_startInput->getString(), start) ||
+            !safeToDouble(m_endInput->getString(), end)) {
             Notification::create("Invalid input!", NotificationIcon::Error)->show();
+            return;
         }
+        // offset необязателен — ошибку игнорируем
+        safeToDouble(m_offsetInput->getString(), offset);
+
+        Mod::get()->setSavedValue("bpm_val",      std::string(m_bpmInput->getString()));
+        Mod::get()->setSavedValue("start_val",    std::string(m_startInput->getString()));
+        Mod::get()->setSavedValue("end_val",      std::string(m_endInput->getString()));
+        Mod::get()->setSavedValue("divisors_val", std::string(m_divisorsInput->getString()));
+        Mod::get()->setSavedValue("offset_val",   std::string(m_offsetInput->getString()));
+
+        std::vector<int> divisors;
+        std::stringstream ss(m_divisorsInput->getString());
+        std::string token;
+        while (ss >> token) {
+            int d = 0;
+            if (safeToInt(token, d)) divisors.push_back(d);
+        }
+        if (divisors.empty()) divisors = {1};
+
+        auto result = generateBPMGuidelines(bpm, start, end, divisors, offset);
+        if (result.guidelines.empty()) {
+            Notification::create("Invalid parameters!", NotificationIcon::Error)->show();
+            return;
+        }
+
+        auto existing = std::string(m_settings->m_guidelineString);
+        m_settings->m_guidelineString = existing + result.guidelines;
+        m_settings->m_guidelinesUpdated = true;
+        if (auto* editor = LevelEditorLayer::get()) editor->levelSettingsUpdated();
+
+        auto savePath = saveFileDialog();
+        if (!savePath.empty()) {
+            std::ofstream outFile(savePath);
+            if (outFile.is_open()) {
+                outFile << result.audacityTxt;
+                outFile.close();
+                Notification::create("Saved & imported!", NotificationIcon::Success)->show();
+            } else {
+                Notification::create("Could not save file!", NotificationIcon::Error)->show();
+            }
+        } else {
+            Notification::create("BPM guidelines generated!", NotificationIcon::Success)->show();
+        }
+
+        this->onClose(nullptr);
     }
 };
 
@@ -297,33 +309,21 @@ class $modify(MyCreateGuidelinesLayer, CreateGuidelinesLayer) {
 
         auto* delegate = m_delegate;
 
-        std::thread([delegate]() {
-            HWND gdWindow = GetActiveWindow();
-            OPENFILENAMEA ofn;
-            char szFile[260] = {0};
-            ZeroMemory(&ofn, sizeof(ofn));
-            ofn.lStructSize = sizeof(ofn);
-            ofn.hwndOwner = gdWindow;
-            ofn.lpstrFile = szFile;
-            ofn.nMaxFile = sizeof(szFile);
-            ofn.lpstrFilter = "Audacity Labels\0*.txt\0All Files\0*.*\0";
-            ofn.nFilterIndex = 1;
-            ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+        // Используем file::pickFile из Geode — кросс-платформенный пикер
+        file::FilePickOptions options{
+            std::nullopt,
+            {{ "Audacity Labels", { "*.txt" } }}
+        };
 
-            bool picked = GetOpenFileNameA(&ofn);
-            std::string path = picked ? std::string(szFile) : "";
-            SetForegroundWindow(gdWindow);
+        file::pickFile(file::PickMode::OpenFile, options, [delegate](ghc::filesystem::path path) {
             s_picking = false;
-            if (path.empty()) return;
-
-            auto guidelines = parseAudacityFile(path);
+            auto guidelines = parseAudacityFile(path.string());
             if (guidelines.empty()) {
                 Loader::get()->queueInMainThread([]() {
                     Notification::create("Failed to parse file!", NotificationIcon::Error)->show();
                 });
                 return;
             }
-
             Loader::get()->queueInMainThread([delegate, guidelines]() {
                 auto* settings = delegate->getLevelSettings();
                 if (!settings) {
@@ -336,6 +336,8 @@ class $modify(MyCreateGuidelinesLayer, CreateGuidelinesLayer) {
                 if (auto* editor = LevelEditorLayer::get()) editor->levelSettingsUpdated();
                 Notification::create("Guidelines imported!", NotificationIcon::Success)->show();
             });
-        }).detach();
+        }, [](auto) {
+            s_picking = false;
+        });
     }
 };
