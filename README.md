@@ -6,7 +6,7 @@
 
 **Import Audacity label tracks and generate BPM-synced guidelines in the GD editor**
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-1.0.1-blue?style=flat-square)
 ![GD Version](https://img.shields.io/badge/GD-2.2081-brightgreen?style=flat-square)
 ![Geode](https://img.shields.io/badge/Geode-5.3.0-orange?style=flat-square)
 
